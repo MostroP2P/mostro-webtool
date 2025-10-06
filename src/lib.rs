@@ -9,6 +9,7 @@ use axum::{
 use bip39::{Language, Mnemonic};
 use nostr_sdk::prelude::{FromMnemonic, Keys, nip06};
 use serde::{Deserialize, Serialize};
+use tower_http::services::ServeDir;
 use tracing_subscriber::{EnvFilter, fmt::SubscriberBuilder};
 
 const MAIN_COLOR: &str = "#8dc63f";
@@ -20,6 +21,72 @@ const BRANCH_INDEX: u32 = 0;
 const IDENTITY_KEY_INDEX: u32 = 0;
 const TRADE_MIN_INDEX: u32 = 1;
 const DEFAULT_TRADE_INDEX: u32 = TRADE_MIN_INDEX;
+
+const ACTIONS: &[&str] = &[
+    "new-order",
+    "take-sell",
+    "take-buy",
+    "pay-invoice",
+    "fiat-sent",
+    "fiat-sent-ok",
+    "release",
+    "released",
+    "cancel",
+    "canceled",
+    "cooperative-cancel-initiated-by-you",
+    "cooperative-cancel-initiated-by-peer",
+    "dispute-initiated-by-you",
+    "dispute-initiated-by-peer",
+    "cooperative-cancel-accepted",
+    "buyer-invoice-accepted",
+    "purchase-completed",
+    "hold-invoice-payment-accepted",
+    "hold-invoice-payment-settled",
+    "hold-invoice-payment-canceled",
+    "waiting-seller-to-pay",
+    "waiting-buyer-invoice",
+    "add-invoice",
+    "buyer-took-order",
+    "rate",
+    "rate-user",
+    "rate-received",
+    "cant-do",
+    "dispute",
+    "admin-cancel",
+    "admin-canceled",
+    "admin-settle",
+    "admin-settled",
+    "admin-add-solver",
+    "admin-take-dispute",
+    "admin-took-dispute",
+    "payment-failed",
+    "invoice-updated",
+    "send-dm",
+    "trade-pubkey",
+    "restore-session",
+    "orders",
+];
+
+const MESSAGE_TYPES: &[&str] = &["order", "dispute", "cant-do", "rate", "dm", "restore"];
+const ORDER_KINDS: &[&str] = &["buy", "sell"];
+const ORDER_STATUSES: &[&str] = &[
+    "active",
+    "canceled",
+    "canceled-by-admin",
+    "settled-by-admin",
+    "completed-by-admin",
+    "dispute",
+    "expired",
+    "fiat-sent",
+    "settled-hold-invoice",
+    "pending",
+    "success",
+    "waiting-buyer-invoice",
+    "waiting-payment",
+    "cooperatively-canceled",
+    "in-progress",
+];
+
 pub const DEFAULT_PORT: u16 = 3000;
 
 pub fn init_tracing() {
@@ -36,6 +103,7 @@ pub fn app() -> Router {
     Router::new()
         .route("/", get(index))
         .route("/api/trade-key", post(derive_trade_key))
+        .nest_service("/static", ServeDir::new("static"))
 }
 
 async fn index() -> Result<Html<String>, AppError> {
@@ -195,6 +263,10 @@ impl IntoResponse for AppError {
 }
 
 fn render_identity_page(ctx: &IdentityContext) -> String {
+    let actions_json = serde_json::to_string(&ACTIONS).unwrap();
+    let message_types_json = serde_json::to_string(&MESSAGE_TYPES).unwrap();
+    let order_kinds_json = serde_json::to_string(&ORDER_KINDS).unwrap();
+    let order_statuses_json = serde_json::to_string(&ORDER_STATUSES).unwrap();
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -223,6 +295,18 @@ body {{
 }}
 .container {{
   width: min(760px, 100%);
+}}
+.brand-logo {{
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  margin-bottom: 1.5rem;
+}}
+.brand-logo img {{
+  // max-width: 192px;
+  width: 60%;
+  height: auto;
+  display: block;
 }}
 form {{
   background: rgba(0, 0, 0, 0.9);
@@ -286,7 +370,9 @@ label {{
   min-width: 240px;
   width: 100%;
 }}
-input[type="text"] {{
+input[type="text"],
+input[type="number"],
+select {{
   background: rgba(33, 51, 13, 0.9);
   border: 1px solid rgba(255, 255, 255, 0.25);
   border-radius: 14px;
@@ -295,6 +381,9 @@ input[type="text"] {{
   color: #fff;
   transition: border-color 0.2s ease, box-shadow 0.2s ease;
   outline: none;
+}}
+select {{
+  cursor: pointer;
 }}
 .toggle-key, .copy-key, .trade-step {{
   background: rgba(255, 255, 255, 0.08);
@@ -340,7 +429,87 @@ input[type="text"] {{
   text-transform: uppercase;
   color: rgba(255, 255, 255, 0.85);
 }}
-input[type="text"]:focus {{
+.message-builder {{
+  margin-top: 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.6rem;
+}}
+.message-columns {{
+  display: grid;
+  gap: 1.5rem;
+}}
+.message-columns.two {{
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}}
+.message-column {{
+  display: flex;
+  flex-direction: column;
+}}
+.payload-fields {{
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}}
+.payload-note {{
+  font-size: 0.85rem;
+  color: rgba(255, 255, 255, 0.7);
+}}
+.payload-group {{
+  display: grid;
+  gap: 1rem;
+}}
+.payload-row {{
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+}}
+.message-preview {{
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}}
+.preview-header {{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}}
+.message-actions {{
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}}
+.json-preview {{
+  background: rgba(0, 0, 0, 0.45);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 14px;
+  padding: 1.5rem;
+  max-height: 360px;
+  overflow: auto;
+  font-size: 0.9rem;
+  color: #d7f9b6;
+  line-height: 1.5;
+}}
+.json-preview code {{
+  white-space: pre;
+  font-family: 'Fira Code', 'JetBrains Mono', 'SFMono-Regular', Menlo, monospace;
+}}
+.textarea-input {{
+  width: 100%;
+  min-height: 140px;
+  resize: vertical;
+  background: rgba(33, 51, 13, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 14px;
+  padding: 0.95rem 1.1rem;
+  font-size: 0.95rem;
+  color: #fff;
+}}
+input[type="text"]:focus,
+input[type="number"]:focus,
+select:focus,
+.textarea-input:focus {{
   border-color: var(--main-color);
   box-shadow: 0 0 0 3px rgba(141, 198, 63, 0.35);
 }}
@@ -392,6 +561,9 @@ code {{
 </head>
 <body>
   <div class="container">
+    <div class="brand-logo">
+      <img src="/static/mostro-web-tool-logo.png" alt="Mostro Web Tool logo">
+    </div>
     <form>
       <fieldset>
         <legend>Keys</legend>
@@ -440,9 +612,168 @@ code {{
           <p class="helper">Provide the destination Mostro daemon public key to build messages correctly.</p>
         </div>
       </fieldset>
+      <fieldset class="message-builder">
+        <legend>Message</legend>
+        <div class="helper">Compose a Mostro message wrapper and payload using the selections below.</div>
+        <div class="message-columns two">
+          <div class="message-column">
+            <div class="label-input">
+              <label for="message-type">Message Kind</label>
+              <select id="message-type" data-wrapper-field="message-type"></select>
+              <p class="helper">Choose the top-level wrapper (order, dispute, etc.).</p>
+            </div>
+            <div class="label-input">
+              <label for="message-action">Action</label>
+              <select id="message-action" data-wrapper-field="action"></select>
+              <p class="helper" id="action-hint">Select an action to tailor payload fields.</p>
+            </div>
+            <div class="label-input">
+              <label for="message-version">Version</label>
+              <input id="message-version" data-wrapper-field="version" type="number" min="1" step="1" value="1">
+            </div>
+            <div class="label-input">
+              <label for="message-id">Message ID</label>
+              <input id="message-id" data-wrapper-field="id" type="text" placeholder="Optional UUID">
+            </div>
+            <div class="label-input">
+              <label for="message-request-id">Request ID</label>
+              <input id="message-request-id" data-wrapper-field="request_id" type="number" min="0" step="1" placeholder="Optional">
+            </div>
+            <div class="label-input">
+              <label for="message-trade-index">Trade Index</label>
+              <input id="message-trade-index" data-wrapper-field="trade_index" type="number" min="0" step="1" placeholder="Optional">
+            </div>
+            <div class="label-input">
+              <label for="payload-mode">Payload Builder</label>
+              <select id="payload-mode">
+                <option value="none">No payload</option>
+                <option value="order">Order payload</option>
+                <option value="custom">Custom JSON</option>
+              </select>
+              <p class="helper" id="payload-hint">Choose how to build the payload for the selected action.</p>
+            </div>
+          </div>
+          <div class="message-column">
+            <div id="payload-fields" class="payload-fields">
+              <p class="payload-note" id="payload-empty-note">Select an action to load payload fields or switch to custom JSON.</p>
+              <div class="payload-group" id="payload-order" data-payload-section="order" hidden>
+                <div class="payload-row">
+                  <div class="label-input">
+                    <label for="order-id">Order ID</label>
+                    <input id="order-id" data-order-field="id" type="text" placeholder="Optional UUID">
+                  </div>
+                  <div class="label-input">
+                    <label for="order-kind">Kind</label>
+                    <select id="order-kind" data-order-field="kind"></select>
+                  </div>
+                  <div class="label-input">
+                    <label for="order-status">Status</label>
+                    <select id="order-status" data-order-field="status"></select>
+                  </div>
+                </div>
+                <div class="payload-row">
+                  <div class="label-input">
+                    <label for="order-amount">Sats Amount</label>
+                    <input id="order-amount" data-order-field="amount" type="number" step="1" min="0" value="0">
+                  </div>
+                  <div class="label-input">
+                    <label for="order-fiat-code">Fiat Code</label>
+                    <input id="order-fiat-code" data-order-field="fiat_code" type="text" value="USD">
+                  </div>
+                  <div class="label-input">
+                    <label for="order-fiat-amount">Fiat Amount</label>
+                    <input id="order-fiat-amount" data-order-field="fiat_amount" type="number" step="1" min="0" value="0">
+                  </div>
+                </div>
+                <div class="payload-row">
+                  <div class="label-input">
+                    <label for="order-payment-method">Payment Method</label>
+                    <input id="order-payment-method" data-order-field="payment_method" type="text" placeholder="e.g. bank transfer" required>
+                  </div>
+                  <div class="label-input">
+                    <label for="order-premium">Premium</label>
+                    <input id="order-premium" data-order-field="premium" type="number" step="1" value="0">
+                  </div>
+                  <div class="label-input">
+                    <label for="order-created-at">Created At (timestamp)</label>
+                    <input id="order-created-at" data-order-field="created_at" type="number" step="1" placeholder="Optional">
+                  </div>
+                </div>
+                <div class="payload-row">
+                  <div class="label-input">
+                    <label for="order-min-amount">Min Amount</label>
+                    <input id="order-min-amount" data-order-field="min_amount" type="number" step="1" placeholder="Optional">
+                  </div>
+                  <div class="label-input">
+                    <label for="order-max-amount">Max Amount</label>
+                    <input id="order-max-amount" data-order-field="max_amount" type="number" step="1" placeholder="Optional">
+                  </div>
+                  <div class="label-input">
+                    <label for="order-expires-at">Expires At (timestamp)</label>
+                    <input id="order-expires-at" data-order-field="expires_at" type="number" step="1" placeholder="Optional">
+                  </div>
+                </div>
+                <div class="payload-row">
+                  <div class="label-input">
+                    <label for="order-buyer-trade">Buyer Trade Pubkey</label>
+                    <input id="order-buyer-trade" data-order-field="buyer_trade_pubkey" type="text" placeholder="Optional">
+                  </div>
+                  <div class="label-input">
+                    <label for="order-seller-trade">Seller Trade Pubkey</label>
+                    <input id="order-seller-trade" data-order-field="seller_trade_pubkey" type="text" placeholder="Optional">
+                  </div>
+                  <div class="label-input">
+                    <label for="order-buyer-invoice">Buyer Invoice</label>
+                    <input id="order-buyer-invoice" data-order-field="buyer_invoice" type="text" placeholder="Optional">
+                  </div>
+                </div>
+              </div>
+              <div class="payload-group" id="payload-custom" data-payload-section="custom" hidden>
+                <label for="payload-json" class="payload-note">Provide a JSON object representing the payload variant.</label>
+                <textarea id="payload-json" class="textarea-input" placeholder='{{"order": {{ ... }}}}'></textarea>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="message-preview">
+          <div class="preview-header">
+            <span class="helper">Generated Message Preview</span>
+            <div class="message-actions">
+              <button class="copy-key" id="copy-message" type="button">Copy JSON</button>
+            </div>
+          </div>
+          <pre class="json-preview"><code id="message-preview">{{}}</code></pre>
+        </div>
+      </fieldset>
     </form>
   </div>
   <script>
+    async function copyText(value) {{
+      if (navigator.clipboard && navigator.clipboard.writeText) {{
+        try {{
+          await navigator.clipboard.writeText(value);
+          return true;
+        }} catch (_) {{
+          // Continue to fallback
+        }}
+      }}
+
+      try {{
+        const temp = document.createElement('textarea');
+        temp.value = value;
+        temp.setAttribute('readonly', '');
+        temp.style.position = 'absolute';
+        temp.style.left = '-9999px';
+        document.body.appendChild(temp);
+        temp.select();
+        document.execCommand('copy');
+        document.body.removeChild(temp);
+        return true;
+      }} catch (_) {{
+        return false;
+      }}
+    }}
+
     (function() {{
       const identityInput = document.getElementById('identity');
       const identityState = document.getElementById('identity-state');
@@ -451,32 +782,6 @@ code {{
       const mnemonicInput = document.getElementById('mnemonic');
       const mostroPubkey = document.getElementById('mostro-pubkey');
       if (!identityInput || !identityState || !identityToggle || !identityCopy || !mnemonicInput || !mostroPubkey) return;
-
-      async function copyText(value) {{
-        if (navigator.clipboard && navigator.clipboard.writeText) {{
-          try {{
-            await navigator.clipboard.writeText(value);
-            return true;
-          }} catch (_) {{
-            // Continue to fallback
-          }}
-        }}
-
-        try {{
-          const temp = document.createElement('textarea');
-          temp.value = value;
-          temp.setAttribute('readonly', '');
-          temp.style.position = 'absolute';
-          temp.style.left = '-9999px';
-          document.body.appendChild(temp);
-          temp.select();
-          document.execCommand('copy');
-          document.body.removeChild(temp);
-          return true;
-        }} catch (_) {{
-          return false;
-        }}
-      }}
 
       const identityPublic = identityInput.value;
       const identityPrivate = identityInput.dataset.private || '';
@@ -487,6 +792,12 @@ code {{
         identityState.textContent = identityShowingPrivate ? 'Private' : 'Public';
         identityToggle.textContent = identityShowingPrivate ? 'Show Public Key' : 'Show Private Key';
       }};
+
+      identityInput.addEventListener('input', () => {{
+        identityShowingPrivate = false;
+        identityState.textContent = 'Custom';
+        identityToggle.textContent = 'Show Private Key';
+      }});
 
       identityToggle.addEventListener('click', () => {{
         identityShowingPrivate = !identityShowingPrivate;
@@ -610,6 +921,259 @@ code {{
       updateTradeDisplay();
       updateTradeControls();
     }})();
+    (function() {{
+      const ACTIONS = JSON.parse('{actions}');
+      const MESSAGE_TYPES = JSON.parse('{message_types}');
+      const ORDER_KINDS = JSON.parse('{order_kinds}');
+      const ORDER_STATUSES = JSON.parse('{order_statuses}');
+
+      const ID_REQUIRED_ACTIONS = new Set([
+        'take-sell','take-buy','fiat-sent','fiat-sent-ok','release','released','dispute','admin-cancel','admin-canceled','admin-settle','admin-settled','rate','rate-received','admin-take-dispute','admin-took-dispute','dispute-initiated-by-you','dispute-initiated-by-peer','waiting-buyer-invoice','purchase-completed','hold-invoice-payment-accepted','hold-invoice-payment-settled','hold-invoice-payment-canceled','waiting-seller-to-pay','buyer-took-order','buyer-invoice-accepted','cooperative-cancel-initiated-by-you','cooperative-cancel-initiated-by-peer','cooperative-cancel-accepted','cancel','invoice-updated','admin-add-solver','send-dm','trade-pubkey','canceled','payment-failed','pay-invoice','add-invoice'
+      ]);
+
+      const messageTypeSelect = document.getElementById('message-type');
+      const actionSelect = document.getElementById('message-action');
+      const versionInput = document.getElementById('message-version');
+      const idInput = document.getElementById('message-id');
+      const requestIdInput = document.getElementById('message-request-id');
+      const tradeIndexInput = document.getElementById('message-trade-index');
+      const payloadModeSelect = document.getElementById('payload-mode');
+      const payloadFields = document.getElementById('payload-fields');
+      const payloadHint = document.getElementById('payload-hint');
+      const actionHint = document.getElementById('action-hint');
+      const previewCode = document.getElementById('message-preview');
+      const copyMessageBtn = document.getElementById('copy-message');
+      const orderKindSelect = document.getElementById('order-kind');
+      const orderStatusSelect = document.getElementById('order-status');
+      const orderFiatCodeInput = document.getElementById('order-fiat-code');
+      const payloadEmptyNote = document.getElementById('payload-empty-note');
+      const payloadOrderSection = document.getElementById('payload-order');
+      const payloadCustomSection = document.getElementById('payload-custom');
+
+      if (!messageTypeSelect || !actionSelect || !payloadModeSelect || !payloadFields || !payloadHint || !previewCode) {{
+        return;
+      }}
+
+      function titleCase(value) {{
+        return value
+          .split('-')
+          .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+          .join(' ');
+      }}
+
+      function populateSelect(select, values) {{
+        if (!select) return;
+        select.innerHTML = '';
+        values.forEach((value) => {{
+          const option = document.createElement('option');
+          option.value = value;
+          option.textContent = titleCase(value);
+          select.appendChild(option);
+        }});
+      }}
+
+      populateSelect(messageTypeSelect, MESSAGE_TYPES);
+      populateSelect(actionSelect, ACTIONS);
+      populateSelect(orderKindSelect, ORDER_KINDS);
+      populateSelect(orderStatusSelect, ORDER_STATUSES);
+      if (orderStatusSelect) {{
+        orderStatusSelect.value = 'pending';
+      }}
+
+      messageTypeSelect.value = MESSAGE_TYPES[0] ?? '';
+      actionSelect.value = ACTIONS[0] ?? '';
+
+      orderKindSelect?.addEventListener('change', updatePreview);
+      orderStatusSelect?.addEventListener('change', updatePreview);
+      orderFiatCodeInput?.addEventListener('input', () => {{
+        orderFiatCodeInput.value = orderFiatCodeInput.value.toUpperCase();
+        updatePreview();
+      }});
+
+      let latestPreview = '{{}}';
+
+      function setPayloadSection(mode) {{
+        if (payloadEmptyNote) {{
+          payloadEmptyNote.hidden = mode !== 'none';
+        }}
+        if (payloadOrderSection) {{
+          payloadOrderSection.hidden = mode !== 'order';
+        }}
+        if (payloadCustomSection) {{
+          payloadCustomSection.hidden = mode !== 'custom';
+        }}
+        payloadModeSelect.value = mode;
+        if (payloadHint) {{
+          if (mode === 'order') {{
+            payloadHint.textContent = 'Populate the order payload fields to describe the new order.';
+          }} else if (mode === 'custom') {{
+            payloadHint.textContent = 'Paste or type a JSON object to use as payload content.';
+          }} else {{
+            payloadHint.textContent = 'Most actions do not require a payload.';
+          }}
+        }}
+      }}
+
+      function parseInteger(value) {{
+        if (value === undefined || value === null || value === '') {{
+          return undefined;
+        }}
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? Math.trunc(parsed) : undefined;
+      }}
+
+      function collectOrderPayload() {{
+        if (payloadOrderSection?.hidden) {{
+          return null;
+        }}
+        const data = {{}};
+        payloadOrderSection.querySelectorAll('[data-order-field]').forEach((input) => {{
+          const key = input.getAttribute('data-order-field');
+          if (!key) return;
+          const value = input.value.trim();
+          if (!value) {{
+            if (['amount', 'fiat_amount', 'premium'].includes(key)) {{
+              data[key] = 0;
+            }}
+            return;
+          }}
+          switch (key) {{
+            case 'amount':
+            case 'fiat_amount':
+            case 'premium':
+            case 'min_amount':
+            case 'max_amount':
+            case 'created_at':
+            case 'expires_at':
+              const numeric = parseInteger(value);
+              if (numeric !== undefined) {{
+                data[key] = numeric;
+              }}
+              break;
+            default:
+              data[key] = value;
+          }}
+        }});
+
+        if (!('amount' in data)) {{
+          data.amount = 0;
+        }}
+        if (!('fiat_amount' in data)) {{
+          data.fiat_amount = 0;
+        }}
+        if (!('premium' in data)) {{
+          data.premium = 0;
+        }}
+        if (!('fiat_code' in data)) {{
+          data.fiat_code = 'USD';
+        }} else if (typeof data.fiat_code === 'string') {{
+          data.fiat_code = data.fiat_code.toUpperCase();
+        }}
+
+        return Object.keys(data).length > 0 ? {{ order: data }} : null;
+      }}
+
+      function collectCustomPayload() {{
+        if (payloadCustomSection?.hidden) {{
+          return null;
+        }}
+        const textarea = document.getElementById('payload-json');
+        if (!textarea) return null;
+        const value = textarea.value.trim();
+        if (!value) return null;
+        try {{
+          const parsed = JSON.parse(value);
+          payloadHint.textContent = 'Custom payload parsed successfully.';
+          return parsed;
+        }} catch (error) {{
+          payloadHint.textContent = 'Invalid JSON payload: ' + error.message;
+          return null;
+        }}
+      }}
+
+      function buildPayload() {{
+        const mode = payloadModeSelect.value;
+        if (mode === 'order') return collectOrderPayload();
+        if (mode === 'custom') return collectCustomPayload();
+        return null;
+      }}
+
+      function buildWrapper() {{
+        const action = actionSelect.value;
+        const wrapper = {{
+          version: parseInteger(versionInput.value) ?? 1,
+          action,
+        }};
+
+        const idValue = idInput.value.trim();
+        if (idValue) {{
+          wrapper.id = idValue;
+        }}
+
+        const requestId = parseInteger(requestIdInput.value);
+        if (requestId !== undefined) {{
+          wrapper.request_id = requestId;
+        }}
+
+        const tradeIndex = parseInteger(tradeIndexInput.value);
+        if (tradeIndex !== undefined) {{
+          wrapper.trade_index = tradeIndex;
+        }}
+
+        const payload = buildPayload();
+        if (payload && Object.keys(payload).length > 0) {{
+          wrapper.payload = payload;
+        }}
+
+        return wrapper;
+      }}
+
+      function updatePreview() {{
+        const messageKind = messageTypeSelect.value || 'order';
+        const wrapper = buildWrapper();
+        const output = {{ [messageKind]: wrapper }};
+        latestPreview = JSON.stringify(output, null, 2);
+        previewCode.textContent = latestPreview;
+      }}
+
+      function onActionChanged() {{
+        const action = actionSelect.value;
+        const requiresId = ID_REQUIRED_ACTIONS.has(action);
+        idInput.required = requiresId;
+        actionHint.textContent = requiresId
+          ? 'This action requires a message id (UUID).'
+          : 'Select an action to tailor payload fields.';
+
+        const defaultMode = action === 'new-order' ? 'order' : 'none';
+        setPayloadSection(defaultMode);
+        updatePreview();
+      }}
+
+      payloadModeSelect.addEventListener('change', () => {{
+        setPayloadSection(payloadModeSelect.value);
+        updatePreview();
+      }});
+
+      actionSelect.addEventListener('change', onActionChanged);
+      messageTypeSelect.addEventListener('change', updatePreview);
+
+      [versionInput, idInput, requestIdInput, tradeIndexInput].forEach((input) => {{
+        input?.addEventListener('input', updatePreview);
+      }});
+
+      payloadFields.addEventListener('input', updatePreview, true);
+      payloadFields.addEventListener('change', updatePreview, true);
+
+      copyMessageBtn?.addEventListener('click', async () => {{
+        const original = copyMessageBtn.textContent;
+        const ok = await copyText(latestPreview);
+        copyMessageBtn.textContent = ok ? 'Copied!' : 'Copy Failed';
+        setTimeout(() => {{ copyMessageBtn.textContent = original; }}, 1500);
+      }});
+
+      onActionChanged();
+      updatePreview();
+    }})();
   </script>
 </body>
 </html>"#,
@@ -625,6 +1189,10 @@ code {{
         trade_private = ctx.trade_secret_hex,
         trade_index = ctx.trade_index,
         trade_min_index = TRADE_MIN_INDEX,
+        actions = actions_json,
+        message_types = message_types_json,
+        order_kinds = order_kinds_json,
+        order_statuses = order_statuses_json,
     )
 }
 

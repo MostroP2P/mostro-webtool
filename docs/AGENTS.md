@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- Root `Cargo.toml` defines the `mostro-message` crate (Rust 2024 edition) and workspace metadata.
+- Root `Cargo.toml` defines the `mostro-webtool` crate (Rust 2024 edition) and workspace metadata.
 - Application entry point lives in `src/main.rs`; add new modules under `src/` using `mod` declarations in `main.rs` or a `lib.rs` if you split logic.
 - Build artifacts land in `target/`; treat this directory as disposable and do not commit it.
 

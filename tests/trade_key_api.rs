@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    http::{Request, StatusCode},
+    http::{Request, StatusCode, header::CONTENT_TYPE},
 };
 use http_body_util::BodyExt;
 use mostro_webtool::app;
@@ -91,4 +91,26 @@ async fn trade_key_endpoint_rejects_identity_index() {
         .to_bytes();
     let value: Value = serde_json::from_slice(&bytes).unwrap();
     assert!(value["error"].as_str().unwrap().contains("at least 1"));
+}
+
+#[tokio::test]
+async fn static_logo_is_served() {
+    let router = app();
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/static/mostro-web-tool-logo.png")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let headers = response.headers();
+    assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "image/png");
+
+    let bytes = BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
+    assert!(!bytes.is_empty());
 }
