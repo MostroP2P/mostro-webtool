@@ -434,6 +434,11 @@ code {{
           <p class="helper">Adjust the index to explore trade keys without affecting identity key derivations.</p>
           <p class="helper warning" id="trade-error" hidden></p>
         </div>
+        <div class="label-input">
+          <label for="mostro-pubkey">Mostro Pubkey</label>
+          <input id="mostro-pubkey" name="mostro-pubkey" type="text" placeholder="Enter Mostro pubkey" required spellcheck="false">
+          <p class="helper">Provide the destination Mostro daemon public key to build messages correctly.</p>
+        </div>
       </fieldset>
     </form>
   </div>
@@ -444,7 +449,8 @@ code {{
       const identityToggle = document.getElementById('toggle-identity');
       const identityCopy = document.getElementById('copy-identity');
       const mnemonicInput = document.getElementById('mnemonic');
-      if (!identityInput || !identityState || !identityToggle || !identityCopy || !mnemonicInput) return;
+      const mostroPubkey = document.getElementById('mostro-pubkey');
+      if (!identityInput || !identityState || !identityToggle || !identityCopy || !mnemonicInput || !mostroPubkey) return;
 
       async function copyText(value) {{
         if (navigator.clipboard && navigator.clipboard.writeText) {{
