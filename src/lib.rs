@@ -303,8 +303,7 @@ body {{
   margin-bottom: 1.5rem;
 }}
 .brand-logo img {{
-  // max-width: 192px;
-  width: 60%;
+  width: 40%;
   height: auto;
   display: block;
 }}
