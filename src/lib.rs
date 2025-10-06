@@ -7,8 +7,12 @@ use axum::{
     routing::{get, post},
 };
 use bip39::{Language, Mnemonic};
-use nostr_sdk::prelude::{FromMnemonic, Keys, nip06};
+use nostr_sdk::prelude::{
+    Event, EventBuilder, FromMnemonic, JsonUtil, Keys, Kind, PublicKey, Tag, Timestamp, nip06, nip44,
+};
+use nostr_sdk::secp256k1::Message;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use tower_http::services::ServeDir;
 use tracing_subscriber::{EnvFilter, fmt::SubscriberBuilder};
 
@@ -103,6 +107,7 @@ pub fn app() -> Router {
     Router::new()
         .route("/", get(index))
         .route("/api/trade-key", post(derive_trade_key))
+        .route("/api/build-gift-wrap", post(build_gift_wrap))
         .nest_service("/static", ServeDir::new("static"))
 }
 
@@ -151,6 +156,75 @@ async fn derive_trade_key(
     };
 
     Ok(Json(response))
+}
+
+#[derive(Deserialize)]
+struct GiftWrapRequest {
+    mnemonic: String,
+    trade_index: u32,
+    mostro_pubkey: String,
+    message_json: String,
+}
+
+#[derive(Serialize)]
+struct GiftWrapResponse {
+    gift_wrap_event: JsonValue,
+}
+
+async fn build_gift_wrap(
+    Json(payload): Json<GiftWrapRequest>,
+) -> Result<Json<GiftWrapResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Parse mostro pubkey
+    let mostro_pubkey = PublicKey::from_hex(&payload.mostro_pubkey).map_err(|e| {
+        json_error(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid Mostro pubkey: {}", e),
+        )
+    })?;
+
+    // Derive identity key (index 0) for seal signing
+    let identity_keys = derive_keys_for_index(&payload.mnemonic, IDENTITY_KEY_INDEX)
+        .map_err(identity_error_to_response)?;
+
+    // Derive trade key for content signature
+    let trade_keys = derive_keys_for_index(&payload.mnemonic, payload.trade_index)
+        .map_err(identity_error_to_response)?;
+
+    // Parse message JSON
+    let message: JsonValue = serde_json::from_str(&payload.message_json).map_err(|e| {
+        json_error(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid message JSON: {}", e),
+        )
+    })?;
+
+    // Build gift wrap using helper function
+    let gift_wrap = create_gift_wrap(
+        &identity_keys,
+        &trade_keys,
+        &mostro_pubkey,
+        message,
+        payload.trade_index,
+    )
+    .await
+    .map_err(|e| {
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to create gift wrap: {}", e),
+        )
+    })?;
+
+    // Serialize to JSON
+    let event_json: JsonValue = serde_json::from_str(&gift_wrap.as_json()).map_err(|e| {
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to serialize gift wrap: {}", e),
+        )
+    })?;
+
+    Ok(Json(GiftWrapResponse {
+        gift_wrap_event: event_json,
+    }))
 }
 
 #[derive(Debug)]
@@ -223,6 +297,169 @@ fn derive_keys_for_index(mnemonic: &str, index: u32) -> Result<Keys, IdentityErr
 
 fn trade_derivation_path(index: u32) -> String {
     format!("{}/{index}", MOSTRO_BASE_PATH)
+}
+
+/// Creates a NIP-59 gift wrap event for Mostro protocol
+///
+/// This implements the Mostro-specific NIP-59 flow as documented in docs/protocol/key_management.md
+///
+/// The structure is:
+/// 1. Rumor: Custom JSON with content = [message, signature]
+/// 2. Seal: Encrypts rumor, signed with IDENTITY KEY (index 0)
+/// 3. Gift Wrap: Encrypts seal, signed with EPHEMERAL KEY
+///
+/// Key Usage:
+/// - Identity Key (index 0): Signs the seal - links to user reputation
+/// - Trade Key (index N): Signs the message - proves ownership of trade key, rotates per trade
+/// - Ephemeral Key (random): Signs gift wrap - provides metadata privacy
+async fn create_gift_wrap(
+    identity_keys: &Keys,
+    trade_keys: &Keys,
+    recipient_pubkey: &PublicKey,
+    message: JsonValue,
+    _trade_index: u32,
+) -> Result<Event, Box<dyn std::error::Error>> {
+    use sha2::{Digest, Sha256};
+
+    // ========================================================================
+    // STEP 1: Create the signature for the rumor content
+    // ========================================================================
+    // Per docs/protocol/key_management.md line 46:
+    // "index N signature of the sha256 hash of the serialized first element of content"
+    //
+    // We sign ONLY the message object (first element of content array)
+    // This proves we control the trade key without revealing it in plaintext
+
+    // Serialize the message to JSON string (compact, no whitespace)
+    let message_str = serde_json::to_string(&message)?;
+
+    // Calculate SHA256 hash of the serialized message
+    let mut hasher = Sha256::new();
+    hasher.update(message_str.as_bytes());
+    let hash = hasher.finalize();
+
+    // Convert hash to secp256k1 Message format
+    let msg = Message::from_digest_slice(&hash)?;
+
+    // Sign the hash with the TRADE KEY (index N)
+    // This signature proves we own the trade key's private key
+    let signature = trade_keys.sign_schnorr(&msg);
+    let signature_hex = signature.to_string();
+
+    // ========================================================================
+    // STEP 2: Build the rumor as a custom JSON object
+    // ========================================================================
+    // The rumor is NOT a standard Nostr UnsignedEvent - it's a manually
+    // constructed JSON with specific structure per Mostro protocol
+    //
+    // Structure per key_management.md lines 32-50:
+    // {
+    //   "id": "<rumor's id>",
+    //   "pubkey": "<Index N pubkey (trade key)>",
+    //   "kind": 1,
+    //   "content": [
+    //     { message object },
+    //     "<signature of first element>"
+    //   ],
+    //   "created_at": timestamp,
+    //   "tags": []
+    // }
+
+    let created_at = Timestamp::now();
+
+    // Build the rumor content as an array: [message, signature]
+    let content_array = serde_json::json!([message, signature_hex]);
+
+    // Calculate event ID: SHA256 of serialized array [0, pubkey, created_at, kind, tags, content]
+    let id_input = serde_json::json!([
+        0,
+        trade_keys.public_key().to_hex(),
+        created_at.as_u64(),
+        1,
+        [],
+        content_array.to_string()
+    ]);
+    let id_str = serde_json::to_string(&id_input)?;
+    let mut id_hasher = Sha256::new();
+    id_hasher.update(id_str.as_bytes());
+    let rumor_id = id_hasher.finalize();
+    let rumor_id_hex = hex::encode(rumor_id);
+
+    // Build the complete rumor JSON
+    let rumor = serde_json::json!({
+        "id": rumor_id_hex,
+        "pubkey": trade_keys.public_key().to_hex(),
+        "kind": 1,
+        "created_at": created_at.as_u64(),
+        "tags": [],
+        "content": content_array
+    });
+
+    // ========================================================================
+    // STEP 3: Create the seal (kind 13)
+    // ========================================================================
+    // The seal encrypts the rumor using NIP-44 encryption
+    // The seal is signed with the IDENTITY KEY (index 0)
+    //
+    // Per key_management.md line 54:
+    // "sig": "<index 0 pubkey (identity key) signature>"
+    //
+    // This links the message to the user's reputation while keeping
+    // the message content private
+
+    let rumor_json_str = serde_json::to_string(&rumor)?;
+
+    // Encrypt the rumor JSON to the recipient (Mostro daemon)
+    // Using identity key as the sender ensures Mostro can track reputation
+    let encrypted_rumor = nip44::encrypt(
+        identity_keys.secret_key(),
+        recipient_pubkey,
+        rumor_json_str,
+        nip44::Version::V2,
+    )?;
+
+    // Build and sign the seal with the IDENTITY KEY
+    // This signature allows Mostro to verify the sender's identity
+    let seal = EventBuilder::new(Kind::Seal, encrypted_rumor)
+        .tags(vec![])  // Seal MUST have empty tags per NIP-59
+        .sign_with_keys(identity_keys)?;
+
+    // ========================================================================
+    // STEP 4: Create the gift wrap (kind 1059)
+    // ========================================================================
+    // The gift wrap encrypts the seal using a random ephemeral key
+    // This provides metadata privacy - observers cannot tell who is communicating
+    //
+    // Per NIP-59:
+    // - Uses random ephemeral key for signing
+    // - Uses random timestamp (within past 2 days) to prevent time correlation
+    // - Includes p tag pointing to recipient
+
+    // Generate a random ephemeral key (used once, then discarded)
+    let ephemeral_keys = Keys::generate();
+
+    // Create random timestamp within past 2 days
+    // This prevents time-based correlation attacks
+    let now = Timestamp::now();
+    let random_offset = rand::random::<u64>() % (2 * 24 * 60 * 60); // 2 days in seconds
+    let random_timestamp = Timestamp::from(now.as_u64() - random_offset);
+
+    // Encrypt the seal to the recipient using the ephemeral key
+    let encrypted_seal = nip44::encrypt(
+        ephemeral_keys.secret_key(),
+        recipient_pubkey,
+        seal.as_json(),
+        nip44::Version::V2,
+    )?;
+
+    // Build and sign the gift wrap with the EPHEMERAL KEY
+    // The p tag allows the recipient to filter for their messages
+    let gift_wrap = EventBuilder::new(Kind::GiftWrap, encrypted_seal)
+        .tags(vec![Tag::public_key(*recipient_pubkey)])
+        .custom_created_at(random_timestamp)
+        .sign_with_keys(&ephemeral_keys)?;
+
+    Ok(gift_wrap)
 }
 
 fn json_error(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
@@ -539,6 +776,63 @@ code {{
   color: var(--main-color);
   font-size: 0.85rem;
 }}
+.send-section {{
+  margin-top: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  align-items: center;
+}}
+.send-button {{
+  background: var(--main-color);
+  color: #000;
+  border: 2px solid var(--main-color);
+  border-radius: 14px;
+  padding: 1rem 2.5rem;
+  font-size: 1.05rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  text-transform: uppercase;
+}}
+.send-button:hover {{
+  background: var(--main-color-dark);
+  border-color: var(--main-color-dark);
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(141, 198, 63, 0.4);
+}}
+.send-button:active {{
+  transform: translateY(0);
+}}
+.send-button:disabled {{
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}}
+.send-status {{
+  padding: 0.75rem 1.5rem;
+  border-radius: 12px;
+  font-size: 0.9rem;
+  letter-spacing: 0.04em;
+  text-align: center;
+  min-width: 300px;
+}}
+.send-status.info {{
+  background: rgba(59, 130, 246, 0.2);
+  border: 1px solid rgba(59, 130, 246, 0.5);
+  color: #93c5fd;
+}}
+.send-status.success {{
+  background: rgba(141, 198, 63, 0.2);
+  border: 1px solid rgba(141, 198, 63, 0.5);
+  color: var(--main-color);
+}}
+.send-status.error {{
+  background: rgba(239, 68, 68, 0.2);
+  border: 1px solid rgba(239, 68, 68, 0.5);
+  color: #fca5a5;
+}}
 @media (max-width: 640px) {{
   body {{
     padding: 1.5rem;
@@ -742,6 +1036,12 @@ code {{
             </div>
           </div>
           <pre class="json-preview"><code id="message-preview">{{}}</code></pre>
+        </div>
+        <div class="send-section">
+          <button class="send-button" id="send-to-mostro" type="button">Send to Mostro</button>
+          <div class="send-status" id="send-status" hidden>
+            <span id="status-text">Ready</span>
+          </div>
         </div>
       </fieldset>
     </form>
@@ -1172,6 +1472,233 @@ code {{
 
       onActionChanged();
       updatePreview();
+    }})();
+
+    // Gift Wrap and Relay Publishing
+    (function() {{
+      const sendButton = document.getElementById('send-to-mostro');
+      const sendStatus = document.getElementById('send-status');
+      const statusText = document.getElementById('status-text');
+      const mostroPubkeyInput = document.getElementById('mostro-pubkey');
+      const mnemonicInput = document.getElementById('mnemonic');
+      const tradeKeyInput = document.getElementById('trade-key');
+
+      if (!sendButton || !sendStatus || !statusText) return;
+
+      function showStatus(message, type) {{
+        sendStatus.hidden = false;
+        sendStatus.className = 'send-status ' + type;
+        statusText.textContent = message;
+      }}
+
+      function hideStatus() {{
+        sendStatus.hidden = true;
+      }}
+
+      async function buildGiftWrapEvent() {{
+        const mostroPubkey = mostroPubkeyInput.value.trim();
+        if (!mostroPubkey) {{
+          throw new Error('Mostro pubkey is required');
+        }}
+
+        const mnemonic = mnemonicInput.value;
+        const tradeIndex = parseInt(tradeKeyInput.dataset.index);
+
+        // Build message from current form state
+        const messageKind = document.getElementById('message-type').value || 'order';
+        const action = document.getElementById('message-action').value;
+        const versionInput = document.getElementById('message-version');
+        const idInput = document.getElementById('message-id');
+        const requestIdInput = document.getElementById('message-request-id');
+        const tradeIndexInput = document.getElementById('message-trade-index');
+
+        const wrapper = {{
+          version: parseInt(versionInput.value) || 1,
+          action,
+        }};
+
+        const idValue = idInput.value.trim();
+        if (idValue) wrapper.id = idValue;
+
+        const requestId = parseInt(requestIdInput.value);
+        if (!isNaN(requestId)) wrapper.request_id = requestId;
+
+        const msgTradeIndex = parseInt(tradeIndexInput.value);
+        if (!isNaN(msgTradeIndex)) wrapper.trade_index = msgTradeIndex;
+
+        // Get payload if any
+        const payloadMode = document.getElementById('payload-mode').value;
+        if (payloadMode === 'order') {{
+          const payload = collectOrderPayload();
+          if (payload) wrapper.payload = payload;
+        }} else if (payloadMode === 'custom') {{
+          const payload = collectCustomPayload();
+          if (payload) wrapper.payload = payload;
+        }}
+
+        const message = {{ [messageKind]: wrapper }};
+
+        // Call API to build gift wrap
+        const response = await fetch('/api/build-gift-wrap', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{
+            mnemonic,
+            trade_index: tradeIndex,
+            mostro_pubkey: mostroPubkey,
+            message_json: JSON.stringify(message)
+          }})
+        }});
+
+        if (!response.ok) {{
+          const error = await response.json();
+          throw new Error(error.error || 'Failed to build gift wrap');
+        }}
+
+        const data = await response.json();
+        return data.gift_wrap_event;
+      }}
+
+      function collectOrderPayload() {{
+        const orderSection = document.getElementById('payload-order');
+        if (!orderSection || orderSection.hidden) return null;
+
+        const data = {{}};
+        orderSection.querySelectorAll('[data-order-field]').forEach((input) => {{
+          const key = input.getAttribute('data-order-field');
+          if (!key) return;
+          const value = input.value.trim();
+          if (!value) {{
+            if (['amount', 'fiat_amount', 'premium'].includes(key)) data[key] = 0;
+            return;
+          }}
+          switch (key) {{
+            case 'amount':
+            case 'fiat_amount':
+            case 'premium':
+            case 'min_amount':
+            case 'max_amount':
+            case 'created_at':
+            case 'expires_at':
+              const numeric = parseInt(value);
+              if (!isNaN(numeric)) data[key] = numeric;
+              break;
+            default:
+              data[key] = value;
+          }}
+        }});
+
+        if (!('amount' in data)) data.amount = 0;
+        if (!('fiat_amount' in data)) data.fiat_amount = 0;
+        if (!('premium' in data)) data.premium = 0;
+        if (!('fiat_code' in data)) data.fiat_code = 'USD';
+        else if (typeof data.fiat_code === 'string') data.fiat_code = data.fiat_code.toUpperCase();
+
+        return Object.keys(data).length > 0 ? {{ order: data }} : null;
+      }}
+
+      function collectCustomPayload() {{
+        const customSection = document.getElementById('payload-custom');
+        if (!customSection || customSection.hidden) return null;
+        const textarea = document.getElementById('payload-json');
+        if (!textarea) return null;
+        const value = textarea.value.trim();
+        if (!value) return null;
+        try {{
+          return JSON.parse(value);
+        }} catch (error) {{
+          throw new Error('Invalid JSON payload: ' + error.message);
+        }}
+      }}
+
+      async function publishToRelay(giftWrapEvent) {{
+        const relay = 'wss://relay.mostro.network';
+
+        return new Promise((resolve, reject) => {{
+          const ws = new WebSocket(relay);
+          let timeout;
+
+          ws.onopen = () => {{
+            // Send EVENT command
+            ws.send(JSON.stringify(['EVENT', giftWrapEvent]));
+
+            // Set timeout for response
+            timeout = setTimeout(() => {{
+              ws.close();
+              reject(new Error('Relay response timeout'));
+            }}, 30000);
+          }};
+
+          ws.onmessage = (event) => {{
+            try {{
+              const data = JSON.parse(event.data);
+              if (data[0] === 'OK') {{
+                clearTimeout(timeout);
+                const eventId = data[1];
+                const accepted = data[2];
+                const message = data[3] || '';
+
+                ws.close();
+
+                if (accepted) {{
+                  resolve(eventId);
+                }} else {{
+                  reject(new Error('Relay rejected event: ' + message));
+                }}
+              }} else if (data[0] === 'NOTICE') {{
+                clearTimeout(timeout);
+                ws.close();
+                reject(new Error('Relay notice: ' + data[1]));
+              }}
+            }} catch (err) {{
+              clearTimeout(timeout);
+              ws.close();
+              reject(new Error('Failed to parse relay response'));
+            }}
+          }};
+
+          ws.onerror = (error) => {{
+            clearTimeout(timeout);
+            reject(new Error('WebSocket connection error'));
+          }};
+
+          ws.onclose = (event) => {{
+            clearTimeout(timeout);
+            if (!event.wasClean) {{
+              reject(new Error('Connection closed unexpectedly'));
+            }}
+          }};
+        }});
+      }}
+
+      sendButton.addEventListener('click', async () => {{
+        try {{
+          sendButton.disabled = true;
+          hideStatus();
+
+          // Validate Mostro pubkey
+          if (!mostroPubkeyInput.value.trim()) {{
+            throw new Error('Please enter Mostro pubkey');
+          }}
+
+          // Step 1: Build gift wrap
+          showStatus('Building gift wrap event...', 'info');
+          const giftWrapEvent = await buildGiftWrapEvent();
+
+          // Step 2: Connect to relay and publish
+          showStatus('Connecting to relay...', 'info');
+          const eventId = await publishToRelay(giftWrapEvent);
+
+          // Success
+          showStatus('Event published successfully! ID: ' + eventId, 'success');
+
+        }} catch (error) {{
+          showStatus('Error: ' + error.message, 'error');
+          console.error('Send error:', error);
+        }} finally {{
+          sendButton.disabled = false;
+        }}
+      }});
     }})();
   </script>
 </body>
