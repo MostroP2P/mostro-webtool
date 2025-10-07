@@ -2,6 +2,11 @@
 name = "mostro-webtool"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+authors = ["Francisco Calderón <fjcalderon@gmail.com>"]
+description = "A web-based tool for generating deterministic keys and building Mostro protocol messages."
+homepage = "https://mostro.network"
+repository = "https://github.com/MostroP2P/mostro-webtools"
 
 [dependencies]
 axum = { version = "0.7.5", features = ["macros"] }
