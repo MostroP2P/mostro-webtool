@@ -117,12 +117,8 @@ async fn test_gift_wrap_contains_valid_rumor() {
     let message = create_test_message();
 
     // Build gift wrap
-    let gift_wrap = call_build_gift_wrap_api(
-        &message,
-        &identity_keys.public_key().to_hex(),
-        trade_index,
-    )
-    .await;
+    let gift_wrap =
+        call_build_gift_wrap_api(&message, &identity_keys.public_key().to_hex(), trade_index).await;
 
     // Verify it's a gift wrap event
     assert_eq!(gift_wrap.kind, Kind::GiftWrap);
@@ -173,12 +169,8 @@ async fn test_gift_wrap_seal_signed_with_identity_key() {
     let message = create_test_message();
 
     // Build gift wrap
-    let gift_wrap = call_build_gift_wrap_api(
-        &message,
-        &identity_keys.public_key().to_hex(),
-        trade_index,
-    )
-    .await;
+    let gift_wrap =
+        call_build_gift_wrap_api(&message, &identity_keys.public_key().to_hex(), trade_index).await;
 
     // Extract rumor using standard NIP-59 function
     let unwrapped = nip59::extract_rumor(&identity_keys, &gift_wrap)
@@ -203,12 +195,8 @@ async fn test_gift_wrap_signature_verification() {
     let message_str = message.as_json().unwrap();
 
     // Build gift wrap
-    let gift_wrap = call_build_gift_wrap_api(
-        &message,
-        &identity_keys.public_key().to_hex(),
-        trade_index,
-    )
-    .await;
+    let gift_wrap =
+        call_build_gift_wrap_api(&message, &identity_keys.public_key().to_hex(), trade_index).await;
 
     // Extract rumor using standard NIP-59 function
     let unwrapped = nip59::extract_rumor(&identity_keys, &gift_wrap)
@@ -220,11 +208,7 @@ async fn test_gift_wrap_signature_verification() {
         serde_json::from_str(&unwrapped.rumor.content).unwrap();
 
     // Verify signature using MostroMessage::verify_signature
-    let is_valid = MostroMessage::verify_signature(
-        message_str,
-        trade_keys.public_key(),
-        signature,
-    );
+    let is_valid = MostroMessage::verify_signature(message_str, trade_keys.public_key(), signature);
 
     assert!(
         is_valid,
@@ -242,12 +226,9 @@ async fn test_gift_wrap_with_different_trade_indices() {
         let message = create_test_message();
 
         // Build gift wrap
-        let gift_wrap = call_build_gift_wrap_api(
-            &message,
-            &identity_keys.public_key().to_hex(),
-            trade_index,
-        )
-        .await;
+        let gift_wrap =
+            call_build_gift_wrap_api(&message, &identity_keys.public_key().to_hex(), trade_index)
+                .await;
 
         // Extract rumor using standard NIP-59 function
         let unwrapped = nip59::extract_rumor(&identity_keys, &gift_wrap)
@@ -279,12 +260,8 @@ async fn test_gift_wrap_message_contains_trade_index() {
     let message = create_test_message();
 
     // Build gift wrap
-    let gift_wrap = call_build_gift_wrap_api(
-        &message,
-        &identity_keys.public_key().to_hex(),
-        trade_index,
-    )
-    .await;
+    let gift_wrap =
+        call_build_gift_wrap_api(&message, &identity_keys.public_key().to_hex(), trade_index).await;
 
     // Extract rumor using standard NIP-59 function
     let unwrapped = nip59::extract_rumor(&identity_keys, &gift_wrap)

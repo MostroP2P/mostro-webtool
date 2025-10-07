@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use tokio::net::TcpListener;
 
-use mostro_webtool::{DEFAULT_PORT, app, init_tracing};
+use mostro_webtool::{app, init_tracing, DEFAULT_PORT};
 
 #[tokio::main]
 async fn main() {

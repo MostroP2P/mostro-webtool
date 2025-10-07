@@ -1169,6 +1169,7 @@ code {{
       const orderKindSelect = document.getElementById('order-kind');
       const orderStatusSelect = document.getElementById('order-status');
       const orderFiatCodeInput = document.getElementById('order-fiat-code');
+      const orderIdInput = document.getElementById('order-id');
       const payloadEmptyNote = document.getElementById('payload-empty-note');
       const payloadOrderSection = document.getElementById('payload-order');
       const payloadCustomSection = document.getElementById('payload-custom');
@@ -1212,6 +1213,8 @@ code {{
         orderFiatCodeInput.value = orderFiatCodeInput.value.toUpperCase();
         updatePreview();
       }});
+      orderIdInput?.addEventListener('input', updatePreview);
+      orderIdInput?.addEventListener('change', updatePreview);
 
       let latestPreview = '{{}}';
 

@@ -1,11 +1,11 @@
 use axum::{
     body::Body,
-    http::{Request, StatusCode, header::CONTENT_TYPE},
+    http::{header::CONTENT_TYPE, Request, StatusCode},
 };
 use http_body_util::BodyExt;
 use mostro_webtool::app;
 use nostr_sdk::prelude::{FromMnemonic, Keys};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tower::ServiceExt;
 
 const SAMPLE_MNEMONIC: &str =
@@ -111,6 +111,9 @@ async fn static_logo_is_served() {
     let headers = response.headers();
     assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "image/png");
 
-    let bytes = BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
+    let bytes = BodyExt::collect(response.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
     assert!(!bytes.is_empty());
 }
