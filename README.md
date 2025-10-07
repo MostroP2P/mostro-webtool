@@ -51,8 +51,8 @@ This tool is intended for **development, testing, and educational purposes**. Fo
 
 ```bash
 # Clone the repository
-git clone https://github.com/MostroP2P/mostro-message.git
-cd mostro-message
+git clone https://github.com/MostroP2P/mostro-webtool.git
+cd mostro-webtool
 
 # Build the project
 cargo build --release
