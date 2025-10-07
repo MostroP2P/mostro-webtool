@@ -7,10 +7,10 @@ use axum::{
     routing::{get, post},
 };
 use bip39::{Language, Mnemonic};
+use mostro_core::message::Message as MostroMessage;
 use nostr_sdk::prelude::{
-    Event, EventBuilder, FromMnemonic, JsonUtil, Keys, Kind, PublicKey, Tag, Timestamp, nip06, nip44,
+    Event, EventBuilder, FromMnemonic, JsonUtil, Keys, PublicKey, Tags, nip06,
 };
-use nostr_sdk::secp256k1::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tower_http::services::ServeDir;
@@ -88,7 +88,6 @@ const ORDER_STATUSES: &[&str] = &[
     "waiting-buyer-invoice",
     "waiting-payment",
     "cooperatively-canceled",
-    "in-progress",
 ];
 
 pub const DEFAULT_PORT: u16 = 3000;
@@ -158,7 +157,7 @@ async fn derive_trade_key(
     Ok(Json(response))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct GiftWrapRequest {
     mnemonic: String,
     trade_index: u32,
@@ -190,21 +189,37 @@ async fn build_gift_wrap(
     let trade_keys = derive_keys_for_index(&payload.mnemonic, payload.trade_index)
         .map_err(identity_error_to_response)?;
 
-    // Parse message JSON
-    let message: JsonValue = serde_json::from_str(&payload.message_json).map_err(|e| {
+    // Log the incoming message JSON for debugging
+    tracing::info!("Payload message: {}", payload.message_json);
+    // Parse message JSON into MostroMessage
+    // Use serde directly to get detailed error messages
+    let mut message: MostroMessage = serde_json::from_str(&payload.message_json).map_err(|e| {
+        tracing::error!("Failed to parse Mostro message: {} | JSON: {}", e, payload.message_json);
         json_error(
             StatusCode::BAD_REQUEST,
-            format!("Invalid message JSON: {}", e),
+            format!("Invalid Mostro message: {}", e),
         )
     })?;
+
+    // Ensure trade_index is set correctly from API payload
+    // The trade_index tells mostrod which trade key to expect for signature verification
+    match &mut message {
+        MostroMessage::Order(ref mut kind)
+        | MostroMessage::Dispute(ref mut kind)
+        | MostroMessage::CantDo(ref mut kind)
+        | MostroMessage::Rate(ref mut kind)
+        | MostroMessage::Dm(ref mut kind)
+        | MostroMessage::Restore(ref mut kind) => {
+            kind.trade_index = Some(payload.trade_index as i64);
+        }
+    }
 
     // Build gift wrap using helper function
     let gift_wrap = create_gift_wrap(
         &identity_keys,
         &trade_keys,
         &mostro_pubkey,
-        message,
-        payload.trade_index,
+        &message,
     )
     .await
     .map_err(|e| {
@@ -316,148 +331,57 @@ async fn create_gift_wrap(
     identity_keys: &Keys,
     trade_keys: &Keys,
     recipient_pubkey: &PublicKey,
-    message: JsonValue,
-    _trade_index: u32,
+    message: &MostroMessage,
 ) -> Result<Event, Box<dyn std::error::Error>> {
-    use sha2::{Digest, Sha256};
-
     // ========================================================================
-    // STEP 1: Create the signature for the rumor content
+    // STEP 1: Create the signature for the message
     // ========================================================================
     // Per docs/protocol/key_management.md line 46:
     // "index N signature of the sha256 hash of the serialized first element of content"
     //
-    // We sign ONLY the message object (first element of content array)
+    // We sign ONLY the message object with the trade key
     // This proves we control the trade key without revealing it in plaintext
 
     // Serialize the message to JSON string (compact, no whitespace)
-    let message_str = serde_json::to_string(&message)?;
+    let message_str = message.as_json().map_err(|e| {
+        format!("Failed to serialize message: {}", e)
+    })?;
 
-    // Calculate SHA256 hash of the serialized message
-    let mut hasher = Sha256::new();
-    hasher.update(message_str.as_bytes());
-    let hash = hasher.finalize();
-
-    // Convert hash to secp256k1 Message format
-    let msg = Message::from_digest_slice(&hash)?;
-
-    // Sign the hash with the TRADE KEY (index N)
-    // This signature proves we own the trade key's private key
-    let signature = trade_keys.sign_schnorr(&msg);
-    let signature_hex = signature.to_string();
+    // Sign the message using MostroMessage::sign() which handles the SHA256 hashing internally
+    let signature = MostroMessage::sign(message_str.clone(), trade_keys);
 
     // ========================================================================
-    // STEP 2: Build the rumor as a custom JSON object
+    // STEP 2: Create the rumor content as serialized (message, signature) tuple
     // ========================================================================
-    // The rumor is NOT a standard Nostr UnsignedEvent - it's a manually
-    // constructed JSON with specific structure per Mostro protocol
+    // The rumor content must be a STRING containing the serialized tuple.
+    // This allows standard NIP-59 tools to work with our custom format.
     //
-    // Structure per key_management.md lines 32-50:
-    // {
-    //   "id": "<rumor's id>",
-    //   "pubkey": "<Index N pubkey (trade key)>",
-    //   "kind": 1,
-    //   "content": [
-    //     { message object },
-    //     "<signature of first element>"
-    //   ],
-    //   "created_at": timestamp,
-    //   "tags": []
-    // }
+    // The content will be: "[{message_object}, \"signature_hex\"]"
+    // When deserialized, it becomes: (MostroMessage, Signature)
 
-    let created_at = Timestamp::now();
-
-    // Build the rumor content as an array: [message, signature]
-    let content_array = serde_json::json!([message, signature_hex]);
-
-    // Calculate event ID: SHA256 of serialized array [0, pubkey, created_at, kind, tags, content]
-    let id_input = serde_json::json!([
-        0,
-        trade_keys.public_key().to_hex(),
-        created_at.as_u64(),
-        1,
-        [],
-        content_array.to_string()
-    ]);
-    let id_str = serde_json::to_string(&id_input)?;
-    let mut id_hasher = Sha256::new();
-    id_hasher.update(id_str.as_bytes());
-    let rumor_id = id_hasher.finalize();
-    let rumor_id_hex = hex::encode(rumor_id);
-
-    // Build the complete rumor JSON
-    let rumor = serde_json::json!({
-        "id": rumor_id_hex,
-        "pubkey": trade_keys.public_key().to_hex(),
-        "kind": 1,
-        "created_at": created_at.as_u64(),
-        "tags": [],
-        "content": content_array
-    });
+    let content = serde_json::to_string(&(message, signature))
+        .map_err(|e| format!("Failed to serialize message and signature: {}", e))?;
 
     // ========================================================================
-    // STEP 3: Create the seal (kind 13)
+    // STEP 3: Build the rumor using EventBuilder
     // ========================================================================
-    // The seal encrypts the rumor using NIP-44 encryption
-    // The seal is signed with the IDENTITY KEY (index 0)
-    //
-    // Per key_management.md line 54:
-    // "sig": "<index 0 pubkey (identity key) signature>"
-    //
-    // This links the message to the user's reputation while keeping
-    // the message content private
+    // Use EventBuilder::text_note() to create a proper UnsignedEvent
+    // with kind=1 and content as a string
 
-    let rumor_json_str = serde_json::to_string(&rumor)?;
-
-    // Encrypt the rumor JSON to the recipient (Mostro daemon)
-    // Using identity key as the sender ensures Mostro can track reputation
-    let encrypted_rumor = nip44::encrypt(
-        identity_keys.secret_key(),
-        recipient_pubkey,
-        rumor_json_str,
-        nip44::Version::V2,
-    )?;
-
-    // Build and sign the seal with the IDENTITY KEY
-    // This signature allows Mostro to verify the sender's identity
-    let seal = EventBuilder::new(Kind::Seal, encrypted_rumor)
-        .tags(vec![])  // Seal MUST have empty tags per NIP-59
-        .sign_with_keys(identity_keys)?;
+    let rumor = EventBuilder::text_note(content).build(trade_keys.public_key());
 
     // ========================================================================
-    // STEP 4: Create the gift wrap (kind 1059)
+    // STEP 4: Create the gift wrap using EventBuilder::gift_wrap()
     // ========================================================================
-    // The gift wrap encrypts the seal using a random ephemeral key
-    // This provides metadata privacy - observers cannot tell who is communicating
-    //
-    // Per NIP-59:
-    // - Uses random ephemeral key for signing
-    // - Uses random timestamp (within past 2 days) to prevent time correlation
-    // - Includes p tag pointing to recipient
+    // This handles:
+    // - Creating the seal (kind 13) signed with identity_keys
+    // - Encrypting the rumor into the seal
+    // - Creating the gift wrap (kind 1059) with ephemeral keys
+    // - Encrypting the seal into the gift wrap
 
-    // Generate a random ephemeral key (used once, then discarded)
-    let ephemeral_keys = Keys::generate();
-
-    // Create random timestamp within past 2 days
-    // This prevents time-based correlation attacks
-    let now = Timestamp::now();
-    let random_offset = rand::random::<u64>() % (2 * 24 * 60 * 60); // 2 days in seconds
-    let random_timestamp = Timestamp::from(now.as_u64() - random_offset);
-
-    // Encrypt the seal to the recipient using the ephemeral key
-    let encrypted_seal = nip44::encrypt(
-        ephemeral_keys.secret_key(),
-        recipient_pubkey,
-        seal.as_json(),
-        nip44::Version::V2,
-    )?;
-
-    // Build and sign the gift wrap with the EPHEMERAL KEY
-    // The p tag allows the recipient to filter for their messages
-    let gift_wrap = EventBuilder::new(Kind::GiftWrap, encrypted_seal)
-        .tags(vec![Tag::public_key(*recipient_pubkey)])
-        .custom_created_at(random_timestamp)
-        .sign_with_keys(&ephemeral_keys)?;
+    let gift_wrap = EventBuilder::gift_wrap(identity_keys, recipient_pubkey, rumor, Tags::default())
+        .await
+        .map_err(|e| format!("Failed to create gift wrap: {}", e))?;
 
     Ok(gift_wrap)
 }
@@ -1354,6 +1278,7 @@ code {{
           }}
         }});
 
+        // Ensure all required fields are present (SmallOrder struct requirements)
         if (!('amount' in data)) {{
           data.amount = 0;
         }}
@@ -1367,6 +1292,9 @@ code {{
           data.fiat_code = 'USD';
         }} else if (typeof data.fiat_code === 'string') {{
           data.fiat_code = data.fiat_code.toUpperCase();
+        }}
+        if (!('payment_method' in data)) {{
+          data.payment_method = '';
         }}
 
         return Object.keys(data).length > 0 ? {{ order: data }} : null;
@@ -1588,11 +1516,13 @@ code {{
           }}
         }});
 
+        // Ensure all required fields are present (SmallOrder struct requirements)
         if (!('amount' in data)) data.amount = 0;
         if (!('fiat_amount' in data)) data.fiat_amount = 0;
         if (!('premium' in data)) data.premium = 0;
         if (!('fiat_code' in data)) data.fiat_code = 'USD';
         else if (typeof data.fiat_code === 'string') data.fiat_code = data.fiat_code.toUpperCase();
+        if (!('payment_method' in data)) data.payment_method = '';
 
         return Object.keys(data).length > 0 ? {{ order: data }} : null;
       }}
