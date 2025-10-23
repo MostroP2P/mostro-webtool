@@ -9,7 +9,7 @@ use axum::{
 use bip39::{Language, Mnemonic};
 use mostro_core::message::Message as MostroMessage;
 use nostr_sdk::prelude::{
-    Event, EventBuilder, FromMnemonic, JsonUtil, Keys, PublicKey, Tags, nip06,
+    Event, EventBuilder, FromMnemonic, JsonUtil, Keys, PublicKey, Tags, nip06, nip59,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -107,6 +107,7 @@ pub fn app() -> Router {
         .route("/", get(index))
         .route("/api/trade-key", post(derive_trade_key))
         .route("/api/build-gift-wrap", post(build_gift_wrap))
+        .route("/api/decrypt-gift-wrap", post(decrypt_gift_wrap))
         .nest_service("/static", ServeDir::new("static"))
 }
 
@@ -168,6 +169,18 @@ struct GiftWrapRequest {
 #[derive(Serialize)]
 struct GiftWrapResponse {
     gift_wrap_event: JsonValue,
+}
+
+#[derive(Deserialize, Debug)]
+struct DecryptGiftWrapRequest {
+    mnemonic: String,
+    trade_index: u32,
+    gift_wrap_event: JsonValue,
+}
+
+#[derive(Serialize)]
+struct DecryptGiftWrapResponse {
+    rumor_content: JsonValue,
 }
 
 async fn build_gift_wrap(
@@ -239,6 +252,57 @@ async fn build_gift_wrap(
 
     Ok(Json(GiftWrapResponse {
         gift_wrap_event: event_json,
+    }))
+}
+
+async fn decrypt_gift_wrap(
+    Json(payload): Json<DecryptGiftWrapRequest>,
+) -> Result<Json<DecryptGiftWrapResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Derive trade key for decryption
+    let trade_keys = derive_keys_for_index(&payload.mnemonic, payload.trade_index)
+        .map_err(identity_error_to_response)?;
+
+    // Parse the gift wrap event from JSON
+    let gift_wrap_json = serde_json::to_string(&payload.gift_wrap_event).map_err(|e| {
+        json_error(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid gift wrap event: {}", e),
+        )
+    })?;
+
+    let gift_wrap_event = Event::from_json(&gift_wrap_json).map_err(|e| {
+        json_error(
+            StatusCode::BAD_REQUEST,
+            format!("Failed to parse gift wrap event: {}", e),
+        )
+    })?;
+
+    // Unwrap the gift wrap to get the rumor
+    let unwrapped = nip59::UnwrappedGift::from_gift_wrap(&trade_keys, &gift_wrap_event)
+        .await
+        .map_err(|e| {
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to decrypt gift wrap: {}", e),
+            )
+        })?;
+
+    // Extract the rumor content
+    let rumor = unwrapped.rumor;
+    let content_str = rumor.content;
+
+    // Parse the content as JSON - it should be a tuple (message, signature)
+    // Note: Mostro responses may have null signatures, so we use Option<String>
+    let content_tuple: (JsonValue, Option<String>) = serde_json::from_str(&content_str).map_err(|e| {
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to parse rumor content: {}", e),
+        )
+    })?;
+
+    // Return the first element (the Mostro message)
+    Ok(Json(DecryptGiftWrapResponse {
+        rumor_content: content_tuple.0,
     }))
 }
 
@@ -757,6 +821,33 @@ code {{
   border: 1px solid rgba(239, 68, 68, 0.5);
   color: #fca5a5;
 }}
+.response-status {{
+  font-size: 0.85rem;
+  padding: 0.4rem 0.9rem;
+  border-radius: 999px;
+  letter-spacing: 0.04em;
+  font-weight: 600;
+}}
+.response-status.listening {{
+  background: rgba(59, 130, 246, 0.2);
+  border: 1px solid rgba(59, 130, 246, 0.5);
+  color: #93c5fd;
+}}
+.response-status.received {{
+  background: rgba(141, 198, 63, 0.2);
+  border: 1px solid rgba(141, 198, 63, 0.5);
+  color: var(--main-color);
+}}
+.response-status.timeout {{
+  background: rgba(251, 191, 36, 0.2);
+  border: 1px solid rgba(251, 191, 36, 0.5);
+  color: #fcd34d;
+}}
+.response-status.error {{
+  background: rgba(239, 68, 68, 0.2);
+  border: 1px solid rgba(239, 68, 68, 0.5);
+  color: #fca5a5;
+}}
 @media (max-width: 640px) {{
   body {{
     padding: 1.5rem;
@@ -966,6 +1057,16 @@ code {{
           <div class="send-status" id="send-status" hidden>
             <span id="status-text">Ready</span>
           </div>
+        </div>
+        <div class="message-preview" id="response-container" hidden>
+          <div class="preview-header">
+            <span class="helper">Message Response</span>
+            <div class="message-actions">
+              <span class="response-status" id="response-status">Waiting for response...</span>
+              <button class="copy-key" id="copy-response" type="button">Copy JSON</button>
+            </div>
+          </div>
+          <pre class="json-preview"><code id="message-response">{{}}</code></pre>
         </div>
       </fieldset>
     </form>
@@ -1625,6 +1726,10 @@ code {{
           // Success
           showStatus('Event published successfully! ID: ' + eventId, 'success');
 
+          // Step 3: Start listening for response
+          const tradePublicKey = tradeKeyInput.value;
+          listenForResponse(tradePublicKey);
+
         }} catch (error) {{
           showStatus('Error: ' + error.message, 'error');
           console.error('Send error:', error);
@@ -1632,6 +1737,114 @@ code {{
           sendButton.disabled = false;
         }}
       }});
+    }})();
+
+    // Response Listener
+    (function() {{
+      const responseContainer = document.getElementById('response-container');
+      const responseStatus = document.getElementById('response-status');
+      const responseCode = document.getElementById('message-response');
+      const copyResponseBtn = document.getElementById('copy-response');
+      const mnemonicInput = document.getElementById('mnemonic');
+      const tradeKeyInput = document.getElementById('trade-key');
+
+      if (!responseContainer || !responseStatus || !responseCode || !copyResponseBtn) return;
+
+      let latestResponse = '{{}}';
+
+      copyResponseBtn.addEventListener('click', async () => {{
+        const original = copyResponseBtn.textContent;
+        const ok = await copyText(latestResponse);
+        copyResponseBtn.textContent = ok ? 'Copied!' : 'Copy Failed';
+        setTimeout(() => {{ copyResponseBtn.textContent = original; }}, 1500);
+      }});
+
+      window.listenForResponse = function(tradePubkey) {{
+        responseContainer.hidden = false;
+        responseStatus.className = 'response-status listening';
+        responseStatus.textContent = 'Listening for response...';
+        responseCode.textContent = '{{}}';
+        latestResponse = '{{}}';
+
+        const relay = 'wss://relay.mostro.network';
+        const ws = new WebSocket(relay);
+        let timeout;
+        let subscriptionId = 'sub-' + Date.now();
+
+        ws.onopen = () => {{
+          // Subscribe to gift wrap events (kind 1059) directed to our trade pubkey
+          const filter = {{}};
+          filter.kinds = [1059];
+          filter['#p'] = [tradePubkey];
+          filter.limit = 1;
+          ws.send(JSON.stringify(['REQ', subscriptionId, filter]));
+
+          // Set 30-second timeout
+          timeout = setTimeout(() => {{
+            ws.close();
+            responseStatus.className = 'response-status timeout';
+            responseStatus.textContent = 'Timeout (no response)';
+          }}, 30000);
+        }};
+
+        ws.onmessage = async (event) => {{
+          try {{
+            const data = JSON.parse(event.data);
+
+            // Check if this is an EVENT message for our subscription
+            if (data[0] === 'EVENT' && data[1] === subscriptionId) {{
+              clearTimeout(timeout);
+              const giftWrapEvent = data[2];
+
+              // Update status
+              responseStatus.className = 'response-status listening';
+              responseStatus.textContent = 'Decrypting response...';
+
+              // Decrypt the gift wrap using our API
+              const tradeIndex = parseInt(tradeKeyInput.dataset.index);
+              const decryptResponse = await fetch('/api/decrypt-gift-wrap', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{
+                  mnemonic: mnemonicInput.value,
+                  trade_index: tradeIndex,
+                  gift_wrap_event: giftWrapEvent
+                }})
+              }});
+
+              if (!decryptResponse.ok) {{
+                const error = await decryptResponse.json();
+                throw new Error(error.error || 'Failed to decrypt response');
+              }}
+
+              const decryptData = await decryptResponse.json();
+              latestResponse = JSON.stringify(decryptData.rumor_content, null, 2);
+              responseCode.textContent = latestResponse;
+              responseStatus.className = 'response-status received';
+              responseStatus.textContent = 'Response received';
+
+              // Close subscription
+              ws.send(JSON.stringify(['CLOSE', subscriptionId]));
+              ws.close();
+            }}
+          }} catch (error) {{
+            clearTimeout(timeout);
+            responseStatus.className = 'response-status error';
+            responseStatus.textContent = 'Error: ' + error.message;
+            console.error('Response error:', error);
+          }}
+        }};
+
+        ws.onerror = (error) => {{
+          clearTimeout(timeout);
+          responseStatus.className = 'response-status error';
+          responseStatus.textContent = 'WebSocket error';
+        }};
+
+        ws.onclose = () => {{
+          clearTimeout(timeout);
+        }};
+      }};
     }})();
   </script>
 </body>
