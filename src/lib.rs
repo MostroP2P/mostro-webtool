@@ -138,13 +138,7 @@ struct ErrorResponse {
 async fn derive_trade_key(
     Json(payload): Json<TradeKeyRequest>,
 ) -> Result<Json<TradeKeyResponse>, (StatusCode, Json<ErrorResponse>)> {
-    if payload.index < TRADE_MIN_INDEX {
-        return Err(json_error(
-            StatusCode::BAD_REQUEST,
-            format!("Trade key index must be at least {TRADE_MIN_INDEX}"),
-        ));
-    }
-
+    // Derive key for any index: 0 = identity key, >= 1 = trade keys
     let keys = derive_keys_for_index(payload.mnemonic.as_str(), payload.index)
         .map_err(identity_error_to_response)?;
 
@@ -914,8 +908,9 @@ code {{
         <div class="path-display">{base_path}</div>
         <div class="label-input">
           <label for="mnemonic">Mnemonic Seed</label>
-          <input id="mnemonic" type="text" value="{mnemonic}" readonly spellcheck="false">
-          <p class="helper">Random 12-word BIP39 seed generated when the page loads. Securely back it up.</p>
+          <input id="mnemonic" type="text" value="{mnemonic}" spellcheck="false">
+          <p class="helper">Random 12-word BIP39 seed generated when the page loads. You can edit or paste your own mnemonic.</p>
+          <p class="helper warning" id="mnemonic-error" hidden></p>
         </div>
         <div class="label-input">
           <div class="label-row">
@@ -1142,8 +1137,8 @@ code {{
       const mostroPubkey = document.getElementById('mostro-pubkey');
       if (!identityInput || !identityState || !identityToggle || !identityCopy || !mnemonicInput || !mostroPubkey) return;
 
-      const identityPublic = identityInput.value;
-      const identityPrivate = identityInput.dataset.private || '';
+      let identityPublic = identityInput.value;
+      let identityPrivate = identityInput.dataset.private || '';
       let identityShowingPrivate = false;
 
       const updateIdentityDisplay = () => {{
@@ -1279,6 +1274,110 @@ code {{
 
       updateTradeDisplay();
       updateTradeControls();
+
+      // Mnemonic change handler - regenerate keys when mnemonic is edited
+      const mnemonicError = document.getElementById('mnemonic-error');
+      let mnemonicTimeout = null;
+
+      mnemonicInput.addEventListener('input', () => {{
+        // Clear previous timeout
+        if (mnemonicTimeout) {{
+          clearTimeout(mnemonicTimeout);
+        }}
+
+        // Clear any previous error
+        if (mnemonicError) {{
+          mnemonicError.hidden = true;
+          mnemonicError.textContent = '';
+        }}
+
+        // Debounce: wait 500ms after user stops typing
+        mnemonicTimeout = setTimeout(async () => {{
+          const newMnemonic = mnemonicInput.value.trim();
+
+          // Basic validation: check if it's not empty and has words
+          if (!newMnemonic) {{
+            if (mnemonicError) {{
+              mnemonicError.textContent = 'Mnemonic cannot be empty';
+              mnemonicError.hidden = false;
+            }}
+            return;
+          }}
+
+          const words = newMnemonic.split(/\s+/);
+          if (words.length !== 12 && words.length !== 24) {{
+            if (mnemonicError) {{
+              mnemonicError.textContent = 'Mnemonic must be 12 or 24 words';
+              mnemonicError.hidden = false;
+            }}
+            return;
+          }}
+
+          try {{
+            // Derive identity key (index 0) and trade key (index 1) in parallel
+            const [identityResponse, tradeResponse] = await Promise.all([
+              fetch('/api/trade-key', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{ mnemonic: newMnemonic, index: 0 }})
+              }}),
+              fetch('/api/trade-key', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{ mnemonic: newMnemonic, index: 1 }})
+              }})
+            ]);
+
+            // Check if both requests succeeded
+            if (!identityResponse.ok) {{
+              const error = await identityResponse.json();
+              throw new Error(error.error || 'Failed to derive identity key');
+            }}
+
+            if (!tradeResponse.ok) {{
+              const error = await tradeResponse.json();
+              throw new Error(error.error || 'Failed to derive trade key');
+            }}
+
+            // Parse responses
+            const identityData = await identityResponse.json();
+            const tradeData = await tradeResponse.json();
+
+            // Update identity key variables
+            identityPublic = identityData.public_key;
+            identityPrivate = identityData.private_key;
+            identityInput.value = identityPublic;
+            identityInput.dataset.private = identityPrivate;
+            identityShowingPrivate = false;
+            updateIdentityDisplay();
+
+            // Update trade key
+            tradePublic = tradeData.public_key;
+            tradePrivate = tradeData.private_key;
+            tradeIndex = 1;
+            tradeInput.value = tradePublic;
+            tradeInput.dataset.index = '1';
+            tradeInput.dataset.private = tradePrivate;
+            tradePath.textContent = tradeData.derivation_path;
+            tradeShowingPrivate = false;
+            updateTradeDisplay();
+            updateTradeControls();
+
+            // Clear any error
+            if (mnemonicError) {{
+              mnemonicError.hidden = true;
+              mnemonicError.textContent = '';
+            }}
+
+          }} catch (error) {{
+            if (mnemonicError) {{
+              mnemonicError.textContent = error.message || 'Failed to regenerate keys';
+              mnemonicError.hidden = false;
+            }}
+            console.error('Mnemonic change error:', error);
+          }}
+        }}, 500);
+      }});
     }})();
     (function() {{
       const ACTIONS = JSON.parse('{actions}');
