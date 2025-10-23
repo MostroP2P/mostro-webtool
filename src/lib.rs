@@ -175,12 +175,14 @@ struct GiftWrapResponse {
 struct DecryptGiftWrapRequest {
     mnemonic: String,
     trade_index: u32,
-    gift_wrap_event: JsonValue,
+    gift_wrap_events: Vec<JsonValue>,
 }
 
 #[derive(Serialize)]
 struct DecryptGiftWrapResponse {
     rumor_content: JsonValue,
+    timestamp: u64,
+    events_count: usize,
 }
 
 async fn build_gift_wrap(
@@ -258,51 +260,84 @@ async fn build_gift_wrap(
 async fn decrypt_gift_wrap(
     Json(payload): Json<DecryptGiftWrapRequest>,
 ) -> Result<Json<DecryptGiftWrapResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Check if we have any events
+    if payload.gift_wrap_events.is_empty() {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "No gift wrap events provided",
+        ));
+    }
+
     // Derive trade key for decryption
     let trade_keys = derive_keys_for_index(&payload.mnemonic, payload.trade_index)
         .map_err(identity_error_to_response)?;
 
-    // Parse the gift wrap event from JSON
-    let gift_wrap_json = serde_json::to_string(&payload.gift_wrap_event).map_err(|e| {
-        json_error(
-            StatusCode::BAD_REQUEST,
-            format!("Invalid gift wrap event: {}", e),
-        )
-    })?;
+    // Store all decrypted messages with their timestamps
+    let mut decrypted_messages: Vec<(JsonValue, u64)> = Vec::new();
 
-    let gift_wrap_event = Event::from_json(&gift_wrap_json).map_err(|e| {
-        json_error(
-            StatusCode::BAD_REQUEST,
-            format!("Failed to parse gift wrap event: {}", e),
-        )
-    })?;
-
-    // Unwrap the gift wrap to get the rumor
-    let unwrapped = nip59::UnwrappedGift::from_gift_wrap(&trade_keys, &gift_wrap_event)
-        .await
-        .map_err(|e| {
+    // Decrypt each gift wrap event
+    for (index, gift_wrap_json_value) in payload.gift_wrap_events.iter().enumerate() {
+        // Parse the gift wrap event from JSON
+        let gift_wrap_json = serde_json::to_string(gift_wrap_json_value).map_err(|e| {
             json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to decrypt gift wrap: {}", e),
+                StatusCode::BAD_REQUEST,
+                format!("Invalid gift wrap event at index {}: {}", index, e),
             )
         })?;
 
-    // Extract the rumor content
-    let rumor = unwrapped.rumor;
-    let content_str = rumor.content;
+        let gift_wrap_event = Event::from_json(&gift_wrap_json).map_err(|e| {
+            json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Failed to parse gift wrap event at index {}: {}", index, e),
+            )
+        })?;
 
-    // Parse the content as JSON - it should be a tuple (message, signature)
-    // Note: Mostro responses may have null signatures, so we use Option<String>
-    let content_tuple: (JsonValue, Option<String>) = serde_json::from_str(&content_str).map_err(|e| {
-        json_error(
+        // Unwrap the gift wrap to get the rumor
+        let unwrapped = match nip59::UnwrappedGift::from_gift_wrap(&trade_keys, &gift_wrap_event).await {
+            Ok(u) => u,
+            Err(e) => {
+                // Log the error but continue with other events
+                tracing::warn!("Failed to decrypt gift wrap event at index {}: {}", index, e);
+                continue;
+            }
+        };
+
+        // Extract the rumor content and timestamp
+        let rumor = unwrapped.rumor;
+        let timestamp = rumor.created_at.as_u64();
+        let content_str = rumor.content;
+
+        // Parse the content as JSON - it should be a tuple (message, signature)
+        // Note: Mostro responses may have null signatures, so we use Option<String>
+        let content_tuple: (JsonValue, Option<String>) = serde_json::from_str(&content_str).map_err(|e| {
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to parse rumor content at index {}: {}", index, e),
+            )
+        })?;
+
+        // Store the message and its timestamp
+        decrypted_messages.push((content_tuple.0, timestamp));
+    }
+
+    // Check if we successfully decrypted any messages
+    if decrypted_messages.is_empty() {
+        return Err(json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to parse rumor content: {}", e),
-        )
-    })?;
+            "Failed to decrypt any gift wrap events",
+        ));
+    }
 
-    // Return the first element (the Mostro message)
+    // Sort by timestamp (descending - newest first)
+    decrypted_messages.sort_by(|a, b| b.1.cmp(&a.1));
+
+    // Return the most recent message
+    let (latest_message, latest_timestamp) = decrypted_messages.into_iter().next().unwrap();
+
     Ok(Json(DecryptGiftWrapResponse {
-        rumor_content: content_tuple.0,
+        rumor_content: latest_message,
+        timestamp: latest_timestamp,
+        events_count: payload.gift_wrap_events.len(),
     }))
 }
 
@@ -1762,7 +1797,7 @@ code {{
       window.listenForResponse = function(tradePubkey) {{
         responseContainer.hidden = false;
         responseStatus.className = 'response-status listening';
-        responseStatus.textContent = 'Listening for response...';
+        responseStatus.textContent = 'Listening for responses...';
         responseCode.textContent = '{{}}';
         latestResponse = '{{}}';
 
@@ -1770,20 +1805,23 @@ code {{
         const ws = new WebSocket(relay);
         let timeout;
         let subscriptionId = 'sub-' + Date.now();
+        let collectedEvents = [];
 
         ws.onopen = () => {{
           // Subscribe to gift wrap events (kind 1059) directed to our trade pubkey
           const filter = {{}};
           filter.kinds = [1059];
           filter['#p'] = [tradePubkey];
-          filter.limit = 1;
+          // No limit - we want all events
           ws.send(JSON.stringify(['REQ', subscriptionId, filter]));
 
           // Set 30-second timeout
           timeout = setTimeout(() => {{
             ws.close();
-            responseStatus.className = 'response-status timeout';
-            responseStatus.textContent = 'Timeout (no response)';
+            if (collectedEvents.length === 0) {{
+              responseStatus.className = 'response-status timeout';
+              responseStatus.textContent = 'Timeout (no response)';
+            }}
           }}, 30000);
         }};
 
@@ -1791,16 +1829,34 @@ code {{
           try {{
             const data = JSON.parse(event.data);
 
-            // Check if this is an EVENT message for our subscription
+            // Collect EVENT messages
             if (data[0] === 'EVENT' && data[1] === subscriptionId) {{
-              clearTimeout(timeout);
               const giftWrapEvent = data[2];
+              collectedEvents.push(giftWrapEvent);
+
+              // Update status with count
+              responseStatus.className = 'response-status listening';
+              responseStatus.textContent = 'Received ' + collectedEvents.length + ' event(s)...';
+            }}
+
+            // Wait for EOSE (End Of Stored Events)
+            if (data[0] === 'EOSE' && data[1] === subscriptionId) {{
+              clearTimeout(timeout);
+
+              // Check if we have any events
+              if (collectedEvents.length === 0) {{
+                responseStatus.className = 'response-status timeout';
+                responseStatus.textContent = 'No responses found';
+                ws.send(JSON.stringify(['CLOSE', subscriptionId]));
+                ws.close();
+                return;
+              }}
 
               // Update status
               responseStatus.className = 'response-status listening';
-              responseStatus.textContent = 'Decrypting response...';
+              responseStatus.textContent = 'Decrypting ' + collectedEvents.length + ' event(s)...';
 
-              // Decrypt the gift wrap using our API
+              // Decrypt all gift wrap events using our API
               const tradeIndex = parseInt(tradeKeyInput.dataset.index);
               const decryptResponse = await fetch('/api/decrypt-gift-wrap', {{
                 method: 'POST',
@@ -1808,20 +1864,25 @@ code {{
                 body: JSON.stringify({{
                   mnemonic: mnemonicInput.value,
                   trade_index: tradeIndex,
-                  gift_wrap_event: giftWrapEvent
+                  gift_wrap_events: collectedEvents
                 }})
               }});
 
               if (!decryptResponse.ok) {{
                 const error = await decryptResponse.json();
-                throw new Error(error.error || 'Failed to decrypt response');
+                throw new Error(error.error || 'Failed to decrypt responses');
               }}
 
               const decryptData = await decryptResponse.json();
               latestResponse = JSON.stringify(decryptData.rumor_content, null, 2);
               responseCode.textContent = latestResponse;
+
+              // Format timestamp
+              const date = new Date(decryptData.timestamp * 1000);
+              const timeStr = date.toLocaleString();
+
               responseStatus.className = 'response-status received';
-              responseStatus.textContent = 'Response received';
+              responseStatus.textContent = 'Latest response (' + timeStr + ')';
 
               // Close subscription
               ws.send(JSON.stringify(['CLOSE', subscriptionId]));
@@ -1832,6 +1893,7 @@ code {{
             responseStatus.className = 'response-status error';
             responseStatus.textContent = 'Error: ' + error.message;
             console.error('Response error:', error);
+            ws.close();
           }}
         }};
 
