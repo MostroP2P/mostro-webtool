@@ -12,7 +12,7 @@ repository = "https://github.com/MostroP2P/mostro-webtools"
 axum = { version = "0.7.5", features = ["macros"] }
 bip39 = { version = "2.2.0", features = ["rand"] }
 hex = "0.4"
-mostro-core = "0.6.55"
+mostro-core = "0.6.56"
 nostr-sdk = { version = "0.43.0", features = ["nip06", "nip44", "nip59"] }
 rand = "0.8"
 serde = { version = "1.0.204", features = ["derive"] }

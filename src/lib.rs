@@ -68,6 +68,7 @@ const ACTIONS: &[&str] = &[
     "send-dm",
     "trade-pubkey",
     "restore-session",
+    "last-trade-index",
     "orders",
 ];
 
